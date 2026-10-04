@@ -98,12 +98,14 @@ __all__ = ['isOleFile', 'OleFileIO', 'OleMetadata', 'enable_logging',
            'DEFECT_FATAL', 'DEFAULT_PATH_ENCODING',
            'MAXREGSECT', 'DIFSECT', 'FATSECT', 'ENDOFCHAIN', 'FREESECT',
            'MAXREGSID', 'NOSTREAM', 'UNKNOWN_SIZE', 'WORD_CLSID',
-           'OleFileIONotClosed'
+           'OleFileIONotClosed', 'OleProperty', 'OlePropertySet',
+           'OleClipboardData', 'FMTID_SUMMARY_INFORMATION',
+           'FMTID_DOCSUM_INFORMATION', 'FMTID_USER_DEFINED_PROPERTIES'
 ]
 
 import io
 import sys
-import struct, array, os.path, datetime, logging, warnings, traceback
+import struct, array, os.path, datetime, decimal, logging, warnings, traceback
 
 #=== COMPATIBILITY WORKAROUNDS ================================================
 
@@ -241,6 +243,7 @@ VT_USERDEFINED=29; VT_LPSTR=30; VT_LPWSTR=31; VT_FILETIME=64;
 VT_BLOB=65; VT_STREAM=66; VT_STORAGE=67; VT_STREAMED_OBJECT=68;
 VT_STORED_OBJECT=69; VT_BLOB_OBJECT=70; VT_CF=71; VT_CLSID=72;
 VT_VECTOR=0x1000;
+VT_ARRAY=0x2000; VT_BYREF=0x4000;
 
 # map property id to name (for debugging purposes)
 VT = {}
@@ -254,6 +257,23 @@ for keyword, var in list(vars().items()):
 
 WORD_CLSID = "00020900-0000-0000-C000-000000000046"
 # TODO: check Excel, PPT, ...
+
+# Well-known FMTIDs for property set streams [MS-OLEPS] 1.9:
+# (same string format as returned by _clsid, without curly braces)
+FMTID_SUMMARY_INFORMATION = 'F29F85E0-4FF9-1068-AB91-08002B27B3D9'
+FMTID_DOCSUM_INFORMATION = 'D5CDD502-2E9C-101B-9397-08002B2CF9AE'
+FMTID_USER_DEFINED_PROPERTIES = 'D5CDD505-2E9C-101B-9397-08002B2CF9AE'
+
+# Common code page identifiers used in property sets [MS-OLEPS] 2.1:
+CODEPAGE_UNICODE = 1200   # UTF-16LE
+CODEPAGE_UTF8 = 65001     # UTF-8
+
+# map code page identifiers to Python codec names, for the ones which do
+# not follow the 'cp<id>' naming scheme:
+CODEPAGE_CODECS = {
+    CODEPAGE_UNICODE: 'utf-16-le',
+    CODEPAGE_UTF8: 'utf-8',
+}
 
 # [PL]: Defect levels to classify parsing errors - see OleFileIO._raise_defect()
 DEFECT_UNSURE =    10    # a case which looks weird, but not sure it's a defect
@@ -387,6 +407,34 @@ def filetime2datetime(filetime):
     # log.debug('timedelta days=%d' % (filetime//(10*1000000*3600*24)))
     return _FILETIME_null_date + datetime.timedelta(microseconds=filetime//10)
 
+
+
+def _decode_codepage_str(raw, codepage):
+    """
+    Decode a CodePageString from a property set, using the code page
+    indicated by the property set itself ([MS-OLEPS] 2.5).
+
+    Code pages 1200 (UTF-16LE) and 65001 (UTF-8) are explicitly supported,
+    other code pages are mapped to the Python codec 'cp<id>' when available.
+    If the code page is None or has no known codec, the raw bytes are
+    returned unchanged (legacy behaviour of getproperties).
+
+    :param bytes raw: raw bytes of the string, including any trailing null
+    :param codepage: int code page identifier, or None
+    :return: str, or bytes when no decoding is possible
+    """
+    if codepage is None:
+        # fall back to the legacy behaviour of getproperties: raw bytes,
+        # without the trailing null terminator/padding:
+        return raw.rstrip(b'\x00')
+    codec = CODEPAGE_CODECS.get(codepage, 'cp%d' % codepage)
+    try:
+        value = raw.decode(codec, errors='replace')
+    except LookupError:
+        # unknown code page, fall back to raw bytes:
+        return raw
+    # remove trailing null characters (terminator and padding):
+    return value.rstrip('\x00')
 
 
 #=== CLASSES ==================================================================
@@ -556,6 +604,132 @@ class OleMetadata:
         for prop in self.DOCSUM_ATTRIBS:
             value = getattr(self, prop)
             print('- {}: {}'.format(prop, repr(value)))
+
+
+class OleClipboardData:
+    """
+    Value of a VT_CF property: a ClipboardData packet ([MS-OLEPS] 2.9).
+
+    Attributes:
+
+    - format_id: int, standard clipboard format identifier. Negative values
+      -1, -2 and -3 stand for CF_METAFILEPICT, CF_DIB and CF_ENHMETAFILE.
+      None when a registered format name is used instead.
+    - format_name: str, registered clipboard format name, or None.
+    - data: bytes, the clipboard payload.
+    """
+
+    def __init__(self, format_id=None, format_name=None, data=b''):
+        self.format_id = format_id
+        self.format_name = format_name
+        self.data = data
+
+    def __repr__(self):
+        return ('OleClipboardData(format_id={!r}, format_name={!r}, '
+                'data={!r})').format(self.format_id, self.format_name,
+                                     self.data)
+
+    def __eq__(self, other):
+        if not isinstance(other, OleClipboardData):
+            return NotImplemented
+        return (self.format_id == other.format_id and
+                self.format_name == other.format_name and
+                self.data == other.data)
+
+    def __ne__(self, other):
+        return not self == other
+
+
+class OleProperty:
+    """
+    A single typed property from an OLE property set.
+
+    Attributes:
+
+    - pid: int, property identifier (2 and above for actual properties,
+      1 for the code page indicator)
+    - name: str, property name from the dictionary of a user-defined
+      property set, None for properties without a dictionary entry
+    - vt: int, the raw property type (VT_* constant, kept as-is, including
+      the VT_VECTOR flag when present)
+    - value: the property value. CodePageString and UnicodeString values
+      are decoded to str using the code page of the property set (falling
+      back to bytes when the code page is unknown). VT_VECTOR values are
+      lists, VT_CF values are OleClipboardData objects, and property types
+      unknown to the parser are returned as raw bytes.
+    """
+
+    def __init__(self, pid, vt, value, name=None):
+        self.pid = pid
+        self.name = name
+        self.vt = vt
+        self.value = value
+
+    @property
+    def vt_name(self):
+        """
+        Name of the property type, e.g. 'VT_LPSTR', or 'UNKNOWN'.
+        """
+        return VT.get(self.vt, 'UNKNOWN')
+
+    def __repr__(self):
+        return ('OleProperty(pid={!r}, name={!r}, vt={!r} ({}), '
+                'value={!r})').format(self.pid, self.name, self.vt,
+                                      self.vt_name, self.value)
+
+
+class OlePropertySet:
+    """
+    A property set from an OLE property set stream, identified by its FMTID
+    ([MS-OLEPS] 2.16). Well-known FMTIDs are FMTID_SUMMARY_INFORMATION,
+    FMTID_DOCSUM_INFORMATION and FMTID_USER_DEFINED_PROPERTIES.
+
+    Attributes:
+
+    - fmtid: str, format identifier of the property set
+    - codepage: int, code page of the property set (property id 1), or None
+    - properties: list of OleProperty objects, in stream order
+    """
+
+    def __init__(self, fmtid, codepage=None):
+        self.fmtid = fmtid
+        self.codepage = codepage
+        self.properties = []
+
+    def __iter__(self):
+        return iter(self.properties)
+
+    def __len__(self):
+        return len(self.properties)
+
+    def get(self, pid, default=None):
+        """
+        Return the OleProperty with the given property id, or default.
+        """
+        for prop in self.properties:
+            if prop.pid == pid:
+                return prop
+        return default
+
+    def get_by_name(self, name, default=None):
+        """
+        Return the first OleProperty with the given name, or default.
+        """
+        for prop in self.properties:
+            if prop.name == name:
+                return prop
+        return default
+
+    def as_dict(self):
+        """
+        Return a dictionary mapping property ids to values.
+        """
+        return dict((prop.pid, prop.value) for prop in self.properties)
+
+    def __repr__(self):
+        return 'OlePropertySet(fmtid={!r}, codepage={!r}, properties={!r})'.format(
+            self.fmtid, self.codepage, self.properties)
+
 
 class OleFileIONotClosed(RuntimeWarning):
     """
@@ -2349,6 +2523,391 @@ class OleFileIO:
         self.metadata = OleMetadata()
         self.metadata.parse_properties(self)
         return self.metadata
+
+    def get_property_sets(self, filename=None, convert_time=True,
+                          no_conversion=None):
+        """
+        Parse OLE property set streams and return typed property sets,
+        including user-defined (custom) properties.
+
+        Unlike getproperties, this method parses every section of the
+        property set stream (distinguished by their FMTID), decodes
+        CodePageString values using the code page stored in each property
+        set, and keeps the raw VT_* type of each property.
+
+        :param filename: path of a property set stream in the storage tree
+            (see openstream for syntax). If None, all property set streams
+            found at the root of the OLE file (names starting with '\\x05')
+            are parsed.
+        :param convert_time: bool, if True timestamps (VT_FILETIME) are
+            converted to Python datetime objects
+        :param no_conversion: None or list of int, property ids of timestamps
+            not to be converted (for example total editing time is not a
+            real timestamp)
+
+        :returns: a list of OlePropertySet objects
+
+        new in version 0.48
+        """
+        # REFERENCE: [MS-OLEPS] https://msdn.microsoft.com/en-us/library/dd942421.aspx
+        if filename is None:
+            streams = [path for path in self.listdir(streams=True, storages=False)
+                       if len(path) == 1 and path[0].startswith('\x05')]
+        elif isinstance(filename, basestring):
+            streams = [[filename]]
+        else:
+            streams = [filename]
+        property_sets = []
+        for stream_path in streams:
+            if not self.exists(stream_path):
+                continue
+            data = self.openstream(stream_path).read()
+            property_sets.extend(
+                self._parse_property_set_stream(data, convert_time,
+                                                no_conversion))
+        return property_sets
+
+    def _parse_property_set_stream(self, data, convert_time=False,
+                                   no_conversion=None):
+        """
+        Parse the raw bytes of a property set stream ([MS-OLEPS] 2.16),
+        return a list of OlePropertySet objects (one per section/FMTID).
+        """
+        if no_conversion is None:
+            no_conversion = []
+        property_sets = []
+        if len(data) < 28:
+            return property_sets
+        num_sections = i32(data, 24)
+        for section_index in iterrange(num_sections):
+            entry_offset = 28 + section_index * 20
+            if entry_offset + 20 > len(data):
+                break
+            try:
+                fmtid = _clsid(data[entry_offset:entry_offset + 16])
+                section_offset = i32(data, entry_offset + 16)
+                if section_offset + 8 > len(data):
+                    continue
+                section_size = i32(data, section_offset)
+                section = data[section_offset:section_offset + section_size]
+                property_sets.append(self._parse_property_section(
+                    fmtid, section, convert_time, no_conversion))
+            except BaseException as exc:
+                # a malformed section is not a fatal error, report it and
+                # continue with the next sections:
+                msg = 'Error while parsing property set section %d: %s' % (
+                    section_index, exc)
+                self._raise_defect(DEFECT_INCORRECT, msg, type(exc))
+        return property_sets
+
+    def _parse_property_section(self, fmtid, section, convert_time,
+                                no_conversion):
+        """
+        Parse one section of a property set stream ([MS-OLEPS] 2.18),
+        return an OlePropertySet.
+        """
+        pset = OlePropertySet(fmtid)
+        if len(section) < 8:
+            return pset
+        num_props = i32(section, 4)
+        # clamp num_props based on the section length:
+        num_props = min(num_props, (len(section) - 8) // 8)
+        entries = []
+        for i in iterrange(num_props):
+            pid = i32(section, 8 + i * 8)
+            offset = i32(section, 12 + i * 8)
+            entries.append((pid, offset))
+        sorted_offsets = sorted(off for (pid, off) in entries
+                                if 0 <= off < len(section))
+        # first pass: read the code page indicator (property id 1):
+        codepage = None
+        for pid, offset in entries:
+            if (pid == 1 and offset + 6 <= len(section)
+                    and i32(section, offset) == VT_I2):
+                codepage = i16(section, offset + 4)
+        pset.codepage = codepage
+        # read the property names dictionary (property id 0), if present:
+        names = {}
+        for pid, offset in entries:
+            if pid == 0:
+                names = self._parse_property_dictionary(section, offset,
+                                                        codepage)
+        # second pass: parse each property value:
+        for pid, offset in entries:
+            if pid == 0:
+                # the dictionary itself is not a property value
+                continue
+            if offset + 4 > len(section):
+                continue
+            # the property value ends where the next property starts:
+            end = len(section)
+            for next_offset in sorted_offsets:
+                if next_offset > offset:
+                    end = next_offset
+                    break
+            region = section[offset:end]
+            vt = i32(region, 0)
+            value = self._parse_typed_property(region, vt, pid, codepage,
+                                               convert_time, no_conversion)
+            pset.properties.append(OleProperty(pid, vt, value,
+                                               names.get(pid)))
+        return pset
+
+    def _parse_property_dictionary(self, section, offset, codepage):
+        """
+        Parse the dictionary of a property set ([MS-OLEPS] 2.6), mapping
+        property ids to names. Return a dict {pid: name}.
+        """
+        names = {}
+        try:
+            num_entries = i32(section, offset)
+            index = offset + 4
+            for _ in iterrange(min(num_entries, 0xFFFF)):
+                if index + 8 > len(section):
+                    break
+                pid = i32(section, index)
+                size = i32(section, index + 4)
+                if codepage == CODEPAGE_UNICODE:
+                    # UnicodeString: size is a number of 16-bit characters
+                    raw = section[index + 8:index + 8 + size * 2]
+                    name = raw.decode('utf-16-le', 'replace').rstrip('\x00')
+                    index += 8 + ((size * 2 + 3) & ~3)
+                else:
+                    # CodePageString: size is a number of bytes
+                    raw = section[index + 8:index + 8 + size]
+                    name = _decode_codepage_str(raw, codepage)
+                    index += 8 + ((size + 3) & ~3)
+                names[pid] = name
+        except BaseException as exc:
+            msg = 'Error while parsing property names dictionary: %s' % exc
+            self._raise_defect(DEFECT_INCORRECT, msg, type(exc))
+        return names
+
+    def _parse_typed_property(self, region, vt, pid, codepage, convert_time,
+                              no_conversion):
+        """
+        Parse a single typed property value ([MS-OLEPS] 2.15).
+
+        :param bytes region: raw bytes of the TypedPropertyValue, starting
+            with the 4 bytes property type
+        :return: the parsed value, or the raw bytes of the region if the
+            property type is not supported
+        """
+        try:
+            if vt & VT_VECTOR:
+                return self._parse_typed_vector(region, vt, pid, codepage,
+                                                convert_time, no_conversion)
+            if vt & (VT_ARRAY | VT_BYREF):
+                # VT_ARRAY and VT_BYREF are not supported, return raw bytes:
+                return region
+            parsed = self._parse_typed_scalar(region, 4, vt, pid, codepage,
+                                              convert_time, no_conversion)
+            if parsed is None:
+                # unknown property type, return raw bytes:
+                return region
+            return parsed[0]
+        except BaseException as exc:
+            msg = 'Error while parsing typed property id %d: %s' % (pid, exc)
+            self._raise_defect(DEFECT_INCORRECT, msg, type(exc))
+            return region
+
+    def _parse_typed_scalar(self, data, offset, vt, pid, codepage,
+                            convert_time, no_conversion):
+        """
+        Parse a scalar (non-vector) property value stored at the given
+        offset. Return a tuple (value, size in bytes of the value, without
+        padding), or None if the property type is not supported.
+        """
+        if vt == VT_EMPTY or vt == VT_NULL:
+            return None, 0
+        if vt == VT_I2:  # 16-bit signed integer
+            value = i16(data, offset)
+            if pid == 1:
+                # the code page indicator (property id 1) is unsigned
+                return value, 2
+            if value >= 32768:
+                value = value - 65536
+            return value, 2
+        if vt == VT_I1:  # 8-bit signed integer
+            value = i8(data[offset])
+            if value >= 128:
+                value = value - 256
+            return value, 1
+        if vt == VT_UI1:  # 8-bit unsigned integer
+            return i8(data[offset]), 1
+        if vt == VT_UI2:  # 16-bit unsigned integer
+            return i16(data, offset), 2
+        if vt in (VT_I4, VT_INT, VT_ERROR, VT_HRESULT):
+            # 32-bit signed integer (VT_ERROR/VT_HRESULT: HRESULT)
+            value = i32(data, offset)
+            if value >= 0x80000000:
+                value = value - 0x100000000
+            return value, 4
+        if vt in (VT_UI4, VT_UINT):  # 32-bit unsigned integer
+            return i32(data, offset), 4
+        if vt == VT_I8:  # 64-bit signed integer
+            low = i32(data, offset)
+            high = i32(data, offset + 4)
+            if high >= 0x80000000:
+                high = high - 0x100000000
+            return low + (high << 32), 8
+        if vt == VT_UI8:  # 64-bit unsigned integer
+            return i32(data, offset) + (i32(data, offset + 4) << 32), 8
+        if vt == VT_R4:  # 32-bit floating point
+            return struct.unpack('<f', data[offset:offset + 4])[0], 4
+        if vt == VT_R8:  # 64-bit floating point
+            return struct.unpack('<d', data[offset:offset + 8])[0], 8
+        if vt == VT_CY:
+            # 64-bit signed integer, scaled by 10000 ([MS-OLEPS] 2.8)
+            low = i32(data, offset)
+            high = i32(data, offset + 4)
+            if high >= 0x80000000:
+                high = high - 0x100000000
+            scaled = low + (high << 32)
+            return decimal.Decimal(scaled) / 10000, 8
+        if vt == VT_DATE:
+            # 64-bit floating point, number of days since 1899-12-30
+            days = struct.unpack('<d', data[offset:offset + 8])[0]
+            value = (datetime.datetime(1899, 12, 30) +
+                     datetime.timedelta(days=days))
+            return value, 8
+        if vt == VT_BOOL:
+            # VARIANT_BOOL, 16 bits, 0x0000=False, 0xFFFF=True
+            return bool(i16(data, offset)), 2
+        if vt in (VT_BSTR, VT_LPSTR):
+            # CodePageString ([MS-OLEPS] 2.5), decoded with the code page
+            # of the property set
+            count = i32(data, offset)
+            raw = data[offset + 4:offset + 4 + count]
+            return _decode_codepage_str(raw, codepage), 4 + count
+        if vt == VT_LPWSTR:
+            # UnicodeString ([MS-OLEPS] 2.4), count in 16-bit characters
+            count = i32(data, offset)
+            raw = data[offset + 4:offset + 4 + count * 2]
+            value = raw.decode('utf-16-le', 'replace').rstrip('\x00')
+            return value, 4 + count * 2
+        if vt in (VT_BLOB, VT_STREAM, VT_STORAGE, VT_STREAMED_OBJECT,
+                  VT_STORED_OBJECT, VT_BLOB_OBJECT):
+            # counted binary data ([MS-OLEPS] 2.7 and 2.11)
+            count = i32(data, offset)
+            return data[offset + 4:offset + 4 + count], 4 + count
+        if vt == VT_FILETIME:
+            value = long(i32(data, offset)) + (long(i32(data, offset + 4)) << 32)
+            # FILETIME is a 64-bit int: "number of 100ns periods
+            # since Jan 1, 1601".
+            if convert_time and pid not in no_conversion:
+                value = filetime2datetime(value)
+            else:
+                # legacy behaviour: number of seconds since Jan 1, 1601
+                value = value // 10000000
+            return value, 8
+        if vt == VT_CLSID:
+            return _clsid(data[offset:offset + 16]), 16
+        if vt == VT_CF:
+            # ClipboardData ([MS-OLEPS] 2.9)
+            size = i32(data, offset)
+            packet = data[offset + 4:offset + 4 + size]
+            return self._parse_clipboard_data(packet, codepage), 4 + size
+        if vt == VT_DECIMAL:
+            # 96-bit scaled unsigned integer ([MS-OLEPS] 2.10)
+            scale = i8(data[offset + 2])
+            sign = i8(data[offset + 3])
+            high = i32(data, offset + 4)
+            low = i32(data, offset + 8) + (i32(data, offset + 12) << 32)
+            mantissa = (high << 64) + low
+            value = decimal.Decimal(mantissa).scaleb(-scale)
+            if sign:
+                value = -value
+            return value, 16
+        # unsupported property type (VT_DISPATCH, VT_UNKNOWN, VT_VARIANT,
+        # VT_PTR, VT_SAFEARRAY, VT_CARRAY, VT_USERDEFINED, VT_VOID, ...):
+        return None
+
+    def _parse_typed_vector(self, region, vt, pid, codepage, convert_time,
+                            no_conversion):
+        """
+        Parse a VT_VECTOR property value ([MS-OLEPS] 2.15), return a list
+        of values. Vector elements are packed without padding, even when
+        they have odd lengths.
+        """
+        base_vt = vt & ~VT_VECTOR
+        count = i32(region, 4)
+        index = 8
+        values = []
+        for _ in iterrange(count):
+            if index > len(region):
+                break
+            try:
+                if base_vt == VT_VARIANT:
+                    # each element is a TypedPropertyValue with its own type
+                    if index + 4 > len(region):
+                        break
+                    element_vt = i32(region, index)
+                    parsed = self._parse_typed_scalar(
+                        region, index + 4, element_vt, pid, codepage,
+                        convert_time, no_conversion)
+                    if parsed is None:
+                        # unknown element type, keep the raw remaining bytes:
+                        values.append(region[index:])
+                        break
+                    value, size = parsed
+                    values.append(value)
+                    index += 4 + size
+                else:
+                    parsed = self._parse_typed_scalar(
+                        region, index, base_vt, pid, codepage, convert_time,
+                        no_conversion)
+                    if parsed is None:
+                        # unknown element type, keep the raw remaining bytes:
+                        values.append(region[index:])
+                        break
+                    value, size = parsed
+                    values.append(value)
+                    index += size
+            except BaseException as exc:
+                msg = ('Error while parsing vector element of property '
+                       'id %d: %s' % (pid, exc))
+                self._raise_defect(DEFECT_INCORRECT, msg, type(exc))
+                break
+        return values
+
+    def _parse_clipboard_data(self, packet, codepage):
+        """
+        Parse a ClipboardData packet ([MS-OLEPS] 2.9), return an
+        OleClipboardData object.
+        """
+        if len(packet) < 4:
+            return OleClipboardData(data=packet)
+        format_or_name = i32(packet, 0)
+        if format_or_name >= 0x80000000:
+            format_or_name = format_or_name - 0x100000000
+        index = 4
+        format_id = None
+        format_name = None
+        if format_or_name < -3 or format_or_name > 0x0190:
+            # a null-terminated registered clipboard format name follows:
+            end = packet.find(b'\x00', index)
+            if end == -1:
+                end = len(packet)
+            raw_name = packet[index:end]
+            if codepage is not None:
+                codec = CODEPAGE_CODECS.get(codepage, 'cp%d' % codepage)
+            else:
+                codec = 'latin-1'
+            try:
+                format_name = raw_name.decode(codec, 'replace')
+            except LookupError:
+                format_name = raw_name.decode('latin-1', 'replace')
+            index = end + 1
+        else:
+            format_id = format_or_name
+        if index + 4 <= len(packet):
+            data_size = i32(packet, index)
+            data = packet[index + 4:index + 4 + data_size]
+        else:
+            data = packet[index:]
+        return OleClipboardData(format_id=format_id, format_name=format_name,
+                                data=data)
 
     def get_userdefined_properties(self, filename, convert_time=False, no_conversion=None):
         """

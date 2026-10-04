@@ -3,6 +3,18 @@ Detailed CHANGELOG
 
 olefile.py
 ----------
+* 2026-10-04 v0.48:
+    - added OleFileIO.get_property_sets(): public typed interface for all
+      property sets (listed by FMTID), including user-defined/custom properties
+      from the DocumentSummaryInformation stream
+    - added OleProperty, OlePropertySet and OleClipboardData classes
+    - properties expose their PID, dictionary name, raw VT_* type and value;
+      VT_VECTOR values are lists, VT_CF values are OleClipboardData objects,
+      unknown VT types return raw bytes instead of raising
+    - VT_LPSTR/VT_BSTR values are decoded using the code page of each property
+      set (explicit support for 1200/UTF-16LE and 65001/UTF-8), falling back
+      to raw bytes when no code page is available
+    - getproperties, get_userdefined_properties and OleMetadata are unchanged
 * 2023-11-30 v0.47.dev6:
     - fixed issue #142: isOleFile has a new data parameter to handle files in memory properly
     - fixed issue #156: write_sect now correctly detects when data is larger than the sector size

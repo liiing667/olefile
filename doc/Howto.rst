@@ -412,6 +412,38 @@ containing user-defined properties.
             print('\t{} {}: {}'.format(index, variable['property_name'],variable['value']))
 
 
+Parse all property sets, including custom properties
+----------------------------------------------------
+
+:py:meth:`olefile.OleFileIO.get_property_sets` parses all the property set
+streams of the OLE file (streams whose name starts with ``'\x05'``) and
+returns a list of :py:class:`olefile.OlePropertySet` objects, one per
+section/FMTID. This includes custom (user-defined) properties stored in the
+``FMTID_USER_DEFINED_PROPERTIES`` section of
+``'\x05DocumentSummaryInformation'``, such as project numbers or approvers
+added by third-party applications.
+
+Each property is an :py:class:`olefile.OleProperty` object with its ``pid``,
+``name`` (from the dictionary of custom property sets, or the standard
+property names), ``property_type`` (the VT_* type, kept as-is) and typed
+``value``. Strings are decoded using the codepage of the property set
+(e.g. 1200 for UTF-16LE, 65001 for UTF-8); if the codepage is missing or
+unsupported, the raw bytes are returned as with
+:py:meth:`olefile.OleFileIO.getproperties`. ``VT_VECTOR`` values are
+returned as lists, ``VT_CF`` as a dict ``{'format': int, 'data': bytes}``,
+and unknown property types as raw bytes, without raising exceptions.
+
+::
+
+    for prop_set in ole.get_property_sets():
+        print(prop_set.fmtid, prop_set.stream_name)
+        for prop in prop_set:
+            print(prop.pid, prop.name, prop.type_name, prop.value)
+    # direct access to a custom property by its identifier:
+    custom = [ps for ps in ole.get_property_sets()
+              if ps.fmtid == olefile.FMTID_USER_DEFINED_PROPERTIES][0]
+    print(custom.get_value(2))
+
 Close the OLE file
 ------------------
 
@@ -444,4 +476,3 @@ and ``-d`` to generate very verbose debugging information.
 
 You may also add the option ``-l debug`` to display debugging messages
 (very verbose).
-

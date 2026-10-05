@@ -3,6 +3,15 @@ Detailed CHANGELOG
 
 olefile.py
 ----------
+* 2026-10-05 v0.47.dev7:
+    - added OleFileIO.get_property_sets(), returning OlePropertySet/OleProperty
+      objects for all property sets by FMTID, including custom user-defined
+      properties (PID, name, original VT_* type and typed value)
+    - strings are decoded using the codepage of each property set (covers
+      1200/UTF-16LE and 65001/UTF-8, other codepages via cp<number>); when no
+      codepage is available the legacy bytes representation is kept
+    - VT_VECTOR values are returned as lists, VT_CF as a dict, unknown VT
+      types as raw bytes without raising exceptions
 * 2023-11-30 v0.47.dev6:
     - fixed issue #142: isOleFile has a new data parameter to handle files in memory properly
     - fixed issue #156: write_sect now correctly detects when data is larger than the sector size
